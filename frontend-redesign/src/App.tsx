@@ -21,6 +21,11 @@ type EventRecord = {
   asset_criticality: string;
   threat_intel_score: number;
   previous_alerts: number;
+  source_label?: string;
+  source_record_id?: string;
+  source_provenance?: Record<string, unknown>;
+  feature_provenance?: Record<string, { origin: string; source_field?: string; note?: string }>;
+  source_record?: Record<string, unknown>;
   decision_outputs: Record<string, string>;
   correction_status?: string;
   impact_status?: string;
@@ -42,6 +47,27 @@ type DatasetInfo = {
   training_record_count?: number | null;
   training_dataset_id?: string | null;
   trained_at?: string | null;
+  dataset_source?: 'synthetic' | 'precinct6';
+  source_revision?: string | null;
+  mapping_version?: string | null;
+  decision_context?: string;
+  source_manifest?: Record<string, unknown>;
+};
+
+type Precinct6Status = {
+  version: string;
+  revision: string;
+  license: string;
+  cache_valid: boolean;
+  declared_rows: number;
+  status: 'NOT_IMPORTED' | 'DOWNLOADING' | 'VERIFYING' | 'IMPORTING' | 'READY' | 'FAILED';
+  expected_rows: number;
+  parsed_rows: number;
+  accepted_rows: number;
+  skipped_rows: number;
+  rejected_rows: number;
+  label_distribution: Record<string, number>;
+  error?: string | null;
 };
 
 type ModelInfo = {
@@ -219,6 +245,7 @@ const DECISIONS = [
 ];
 const FEATURE_COLUMNS: Array<{ key: keyof EventRecord; label: string }> = [
   { key: 'event_id', label: 'Event ID' },
+  { key: 'source_label', label: 'Precinct label (not D1–D5)' },
   { key: 'timestamp', label: 'Timestamp' },
   { key: 'user_id', label: 'User' },
   { key: 'source_ip', label: 'Source IP' },
@@ -317,6 +344,9 @@ export default function App() {
   const [isLeavingHero, setIsLeavingHero] = useState(false);
   const [trainingMessageIndex, setTrainingMessageIndex] = useState(0);
   const [dataset, setDataset] = useState<DatasetInfo | null>(null);
+  const [precinct6Status, setPrecinct6Status] = useState<Precinct6Status | null>(null);
+  const [experimentSource, setExperimentSource] = useState<'precinct6' | 'synthetic'>('precinct6');
+  const [correctionEvidence, setCorrectionEvidence] = useState('');
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [latestTraining, setLatestTraining] = useState<TrainingJob | null>(null);
   const [rows, setRows] = useState<EventRecord[]>([]);
@@ -357,6 +387,7 @@ export default function App() {
     const result = await requestJson<EventDetails>(`${API_BASE}/api/datasets/${datasetId}/events/${eventId}`);
     setDetails(result);
     setProposedFeatures(Object.fromEntries(EDITABLE_FEATURES.map((name) => [name, result.current_state[name]])));
+    setCorrectionEvidence('');
     setPreview(null);
     setGraph({ nodes: [], edges: [] });
     setCorrectionId('');
@@ -376,6 +407,12 @@ export default function App() {
     const result = await requestJson<ModelStatus>(`${API_BASE}/api/models/status`);
     setModelStatus(result);
     setLatestTraining(result.latest_training);
+    return result;
+  }, []);
+
+  const loadPrecinct6Status = useCallback(async () => {
+    const result = await requestJson<Precinct6Status>(`${API_BASE}/api/datasets/sources/precinct6`);
+    setPrecinct6Status(result);
     return result;
   }, []);
 
@@ -409,8 +446,10 @@ export default function App() {
       const [active, status] = await Promise.all([
         requestJson<DatasetInfo | null>(`${API_BASE}/api/datasets/active`),
         loadModelStatus(),
+        loadPrecinct6Status(),
       ]);
       setDataset(active);
+      if (active) setExperimentSource(active.dataset_source === 'precinct6' ? 'precinct6' : 'synthetic');
       setPage(1);
       setGraph({ nodes: [], edges: [] });
       if (active) {
@@ -431,11 +470,21 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [descending, loadAudit, loadModelStatus, loadRows, search, sortBy]);
+  }, [descending, loadAudit, loadModelStatus, loadPrecinct6Status, loadRows, search, sortBy]);
 
   useEffect(() => {
     void loadActiveDataset();
   }, []);
+
+  useEffect(() => {
+    if (!precinct6Status || !['DOWNLOADING', 'VERIFYING', 'IMPORTING'].includes(precinct6Status.status)) return;
+    const interval = window.setInterval(() => {
+      void loadPrecinct6Status().catch((cause) => {
+        setError(cause instanceof Error ? cause.message : 'Could not refresh the Precinct6 import status.');
+      });
+    }, 2000);
+    return () => window.clearInterval(interval);
+  }, [loadPrecinct6Status, precinct6Status]);
 
   useEffect(() => {
     recordFrontendLog('frontend.application.started', { path: window.location.pathname });
@@ -796,12 +845,35 @@ export default function App() {
     setAiError('');
   };
 
+  const importPrecinct6 = async () => {
+    setError('');
+    setMessage('');
+    try {
+      const result = await requestJson<Precinct6Status>(`${API_BASE}/api/datasets/import/precinct6`, { method: 'POST' });
+      setPrecinct6Status(result);
+      setExperimentSource('precinct6');
+      if (result.status === 'READY') {
+        setMessage(`Precinct6 revision ${result.revision} is verified with ${result.accepted_rows.toLocaleString()} unique source records.`);
+      } else if (result.status === 'FAILED') {
+        setError(result.error || 'Precinct6 import failed.');
+      } else {
+        setMessage('Precinct6 import started. The pinned Parquet file and each imported record will be verified; synthetic data will not be substituted.');
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not start the Precinct6 import.');
+    }
+  };
+
   const generateDataset = async () => {
     setShowGenerateDialog(false);
     setBusy(true);
     setError('');
     try {
-      const next = await requestJson<DatasetInfo>(`${API_BASE}/api/datasets`, { method: 'POST' });
+      if (experimentSource === 'precinct6' && (precinct6Status?.status !== 'READY' || !precinct6Status.cache_valid)) {
+        throw new Error('Import and verify the pinned Precinct6 dataset before creating a real-data experiment.');
+      }
+      const path = experimentSource === 'precinct6' ? '/api/datasets/precinct6' : '/api/datasets';
+      const next = await requestJson<DatasetInfo>(`${API_BASE}${path}`, { method: 'POST' });
       setDataset(next);
       setSearch('');
       setSortBy('event_id');
@@ -817,7 +889,9 @@ export default function App() {
       setShowWorkbench(true);
       await loadRows(next, 1, '', 'event_id', false);
       await loadAudit(next.dataset_id);
-      setMessage(`New 200-record experiment generated without decision labels. Click TRAIN EXPERIMENT to label it with frozen ${next.model_id} ${next.model_version}.`);
+      setMessage(experimentSource === 'precinct6'
+        ? `Created a 200-record experiment from fresh Precinct6 signals. Original labels and source rows are preserved; missing decision features are explicitly simulated. Train the pinned simulation model ${next.model_version} to evaluate the rewind workflow.`
+        : `New 200-record synthetic test experiment generated without decision labels. Click TRAIN EXPERIMENT to label it with frozen ${next.model_id} ${next.model_version}.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not create a new dataset.');
     } finally {
@@ -841,7 +915,7 @@ export default function App() {
       }
       await loadModelStatus();
       if (current.status === 'FAILED') throw new Error(current.error || 'Model training failed.');
-      setMessage(`Training complete: SOC-MODEL-${current.model_version} trained on ${current.record_count.toLocaleString()} records for ${current.epochs} epochs. Generate a new experiment to use this frozen model.`);
+      setMessage(`Simulation training complete: SOC-MODEL-${current.model_version} trained on ${current.record_count.toLocaleString()} synthetic, rule-labeled records. These are not Precinct6 ground-truth labels.`);
       setShowExperimentReady(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not train the model.');
@@ -863,7 +937,9 @@ export default function App() {
       await loadRows(result, page, search, sortBy, descending);
       if (details?.current_state.event_id) await loadEvent(result.dataset_id, details.current_state.event_id);
       await loadAudit(result.dataset_id);
-      setMessage(`Experiment labeled: D1–D5 predictions generated for ${result.training_record_count} records using frozen ${result.model_id} ${result.model_version}.`);
+      setMessage(result.dataset_source === 'precinct6'
+        ? `Experiment evaluated: D1–D5 outputs use explicitly simulated decision context and the frozen ${result.model_id} ${result.model_version}; the Precinct6 label was not used as a decision target.`
+        : `Synthetic experiment labeled: D1–D5 outputs generated for ${result.training_record_count} records using frozen ${result.model_id} ${result.model_version}.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not label the experiment.');
     } finally {
@@ -906,6 +982,10 @@ export default function App() {
       setError('Preview the current feature changes before applying this correction.');
       return;
     }
+    if (correctionEvidence.trim().length < 10) {
+      setError('Provide at least 10 characters describing the evidence for this correction.');
+      return;
+    }
     setBusy(true);
     setError('');
     setMessage('');
@@ -913,9 +993,14 @@ export default function App() {
       const result = await requestJson<{ correction_id: string }>(`${API_BASE}/api/datasets/${dataset.dataset_id}/corrections`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event_id: selectedEvent.event_id, changes: changedValues }),
+        body: JSON.stringify({
+          event_id: selectedEvent.event_id,
+          changes: changedValues,
+          evidence: correctionEvidence.trim(),
+        }),
       });
       setCorrectionId(result.correction_id);
+      setCorrectionEvidence('');
       setDataset((current) => current ? { ...current, workflow_status: 'CORRECTION_APPLIED' } : current);
       setRows((current) => current.map((row) => (
         row.event_id === selectedEvent.event_id ? { ...row, correction_status: 'PROPOSED' } : row
@@ -1070,6 +1155,69 @@ export default function App() {
   const activePageMode = !showWorkbench
     ? (showOverview ? (showExperimentReady ? 'ready' : 'overview') : 'hero')
     : 'workbench';
+  const importInProgress = ['DOWNLOADING', 'VERIFYING', 'IMPORTING'].includes(precinct6Status?.status ?? '');
+  const sourcePicker = (
+    <section className="source-picker-panel" aria-label="Experiment dataset source">
+      <div className="eyebrow">EXPERIMENT DATA SOURCE</div>
+      <div className="source-mode-options">
+        <label className={experimentSource === 'precinct6' ? 'source-mode-option selected' : 'source-mode-option'}>
+          <input
+            type="radio"
+            name="experiment-source"
+            value="precinct6"
+            checked={experimentSource === 'precinct6'}
+            onChange={() => setExperimentSource('precinct6')}
+          />
+          <span>Real-world dataset</span>
+          <small>
+            Precinct6 v{precinct6Status?.version ?? '2.1.0'} ·             {precinct6Status?.status === 'READY' && precinct6Status.cache_valid
+              ? `${precinct6Status.accepted_rows.toLocaleString()} verified signals`
+              : precinct6Status?.status === 'READY'
+                ? 'Local cache missing or changed; restore it before use'
+              : precinct6Status?.status === 'FAILED'
+                ? 'Import failed; retry to see the explicit error'
+                : 'Import required; no data is downloaded until requested'}
+          </small>
+        </label>
+        <label className={experimentSource === 'synthetic' ? 'source-mode-option selected' : 'source-mode-option'}>
+          <input
+            type="radio"
+            name="experiment-source"
+            value="synthetic"
+            checked={experimentSource === 'synthetic'}
+            onChange={() => setExperimentSource('synthetic')}
+          />
+          <span>Synthetic test dataset</span>
+          <small>Generated independently for simulator tests; never mixed into a Precinct6 experiment.</small>
+        </label>
+      </div>
+      {experimentSource === 'precinct6' && (
+        <div className="source-import-actions">
+          <button
+            className="secondary"
+            onClick={() => void importPrecinct6()}
+            disabled={importInProgress || (precinct6Status?.status === 'READY' && precinct6Status.cache_valid)}
+          >
+            {precinct6Status?.status === 'READY' && precinct6Status.cache_valid
+              ? 'DATASET VERIFIED'
+              : precinct6Status?.status === 'READY'
+                ? 'RESTORE VERIFIED DATASET CACHE'
+              : importInProgress
+                ? `IMPORTING ${precinct6Status?.parsed_rows.toLocaleString() ?? '0'} / ${precinct6Status?.expected_rows.toLocaleString() ?? '2,011,674'}`
+                : precinct6Status?.status === 'FAILED'
+                  ? 'RETRY IMPORT'
+                  : 'IMPORT PINNED PRECINCT6 DATASET'}
+          </button>
+          <span>{precinct6Status?.status ?? 'Loading source status…'} · Apache-2.0 · revision {precinct6Status?.revision ?? '—'}</span>
+          {precinct6Status?.error && <span role="alert">Import error: {precinct6Status.error}</span>}
+        </div>
+      )}
+      <p>
+        Precinct6 labels are automated incident-correlation labels, not ground truth for D1–D5.
+        Missing decision features remain marked simulated or unavailable; the source record is preserved.
+      </p>
+    </section>
+  );
 
   return (
     <div className={`app-root mode-${activePageMode}`}>
@@ -1107,17 +1255,22 @@ export default function App() {
                 <p className="overview-kicker">GLOBAL MODEL // READY</p>
                 <h1>Model trained<br /><span>successfully.</span></h1>
                 <p className="overview-copy">
-                  Your global model has learned from 20,000 events and is ready to power a fresh decision experiment.
+                  The five decision models are trained on 20,000 synthetic, rule-labeled scenarios. Precinct6 labels are not used as D1–D5 targets.
                 </p>
+                {sourcePicker}
                 <div className="ready-card">
                   <div><span>MODEL</span><strong>SOC-MODEL-{latestTraining?.model_version ?? modelStatus?.active_model?.model_version ?? '—'}</strong></div>
-                  <div><span>TRAINING SET</span><strong>{(latestTraining?.record_count ?? modelStatus?.training_record_count ?? 20000).toLocaleString()} EVENTS</strong></div>
+                  <div><span>TRAINING SET</span><strong>{(latestTraining?.record_count ?? modelStatus?.training_record_count ?? 20000).toLocaleString()} SYNTHETIC SCENARIOS</strong></div>
                   <div><span>STATUS</span><strong>FROZEN &amp; READY</strong></div>
                 </div>
-                <button className="overview-train-button generate-button" onClick={() => setShowGenerateDialog(true)} disabled={busy}>
-                  GENERATE 200-ROW EXPERIMENT <span className="overview-button-arrow">↗</span>
+                <button
+                  className="overview-train-button generate-button"
+                  onClick={() => setShowGenerateDialog(true)}
+                  disabled={busy || (experimentSource === 'precinct6' && (precinct6Status?.status !== 'READY' || !precinct6Status.cache_valid))}
+                >
+                  {experimentSource === 'precinct6' ? 'CREATE 200-RECORD REAL-DATA EXPERIMENT' : 'GENERATE 200-ROW SYNTHETIC EXPERIMENT'} <span className="overview-button-arrow">↗</span>
                 </button>
-                <p className="ready-note">A new unlabeled experiment will be created without changing the stored training data.</p>
+                <p className="ready-note">Every experiment is pinned to the selected source and frozen model. Precinct6 samples are never reused or silently replaced with synthetic rows.</p>
               </section>
               {showGenerateDialog && (
                 <div className="generate-modal-backdrop" role="presentation">
@@ -1126,8 +1279,9 @@ export default function App() {
                     <p className="eyebrow">NEW EXPERIMENT // CONFIRM</p>
                     <h2 id="generate-modal-title-ready">Create a fresh<br /><span>200-record experiment?</span></h2>
                     <p>
-                      A new unlabeled experiment will be generated from the frozen global model.
-                      Your current dataset will remain stored for reproducibility.
+                      {experimentSource === 'precinct6'
+                        ? 'Use 200 fresh, unused records from the pinned Precinct6 signals file. Missing D1–D5 context is labeled simulated; if 200 records are unavailable, creation fails without fallback.'
+                        : 'Generate 200 new synthetic test records. This source stays separate from every imported Precinct6 experiment.'}
                     </p>
                     <div className="generate-modal-actions">
                       <button className="secondary" onClick={() => setShowGenerateDialog(false)}>CANCEL</button>
@@ -1157,12 +1311,13 @@ export default function App() {
                   <div><strong>05</strong><span>DECISION LAYERS</span></div>
                   <div><strong>01</strong><span>REWIND ENGINE</span></div>
                 </div>
+                {sourcePicker}
                 <button
                   className="overview-train-button"
                   onClick={() => void trainModel()}
                   disabled={busy || isModelTraining}
                 >
-                  {isModelTraining ? 'TRAINING MODEL' : modelReady ? 'RETRAIN GLOBAL MODEL' : 'TRAIN GLOBAL MODEL'}
+                  {isModelTraining ? 'TRAINING SIMULATION MODELS' : modelReady ? 'RETRAIN SIMULATION MODELS' : 'TRAIN SIMULATION MODELS'}
                   <span className="overview-button-arrow">↗</span>
                 </button>
                 <button className="overview-enter" onClick={() => setShowWorkbench(true)} disabled={!modelReady}>
@@ -1307,10 +1462,13 @@ export default function App() {
                 <h2>{dataset?.dataset_id ?? (modelStatus ? 'No experiment generated' : 'Loading experiment…')}</h2>
                 {dataset && (
                   <div className="dataset-meta">
+                    <span>{dataset.dataset_source === 'precinct6' ? 'REAL-WORLD DATASET' : 'SYNTHETIC TEST DATASET'}</span>
                     <span>{dataset?.record_count ?? 0} records</span>
                     <span>Seed: {dataset?.random_seed ?? dataset?.seed ?? '—'}</span>
                     <span>Created: {formatDate(dataset.created_at)}</span>
                     <span>{dataset.experiment_id}</span>
+                    {dataset.source_revision && <span>Precinct6 revision: {dataset.source_revision}</span>}
+                    {dataset.mapping_version && <span>Feature mapping: {dataset.mapping_version}</span>}
                   </div>
                 )}
                 {dataset && (
@@ -1321,12 +1479,17 @@ export default function App() {
                     </span>
                     <span>Workflow: {dataset.workflow_status}</span>
                     <span>Frozen model: {dataset.model_id} · {dataset.model_version}</span>
-                    <span>Global training set: {modelStatus?.models.find((model) => model.model_id === dataset.model_id)?.training_record_count.toLocaleString() ?? '—'} rows</span>
+                    <span>Decision context: {dataset.decision_context === 'simulated_context' ? 'SIMULATED (explicitly marked)' : 'SYNTHETIC TEST SCENARIO'}</span>
+                    <span>Model training: {modelStatus?.models.find((model) => model.model_id === dataset.model_id)?.training_record_count.toLocaleString() ?? '—'} synthetic rows</span>
                   </div>
                 )}
               </div>
               <div className="dataset-actions">
-                <button className="secondary" onClick={() => setShowGenerateDialog(true)} disabled={busy || training || !modelStatus?.active_model}>
+                <button
+                  className="secondary"
+                  onClick={() => setShowGenerateDialog(true)}
+                  disabled={busy || training || !modelStatus?.active_model || (experimentSource === 'precinct6' && (precinct6Status?.status !== 'READY' || !precinct6Status.cache_valid))}
+                >
                   GENERATE 200-ROW EXPERIMENT ↗
                 </button>
                 {dataset && dataset.training_status !== 'TRAINED' && (
@@ -1343,7 +1506,7 @@ export default function App() {
                   <div className="eyebrow">STAGE 01 // EVENT EXPLORER</div>
                   <h2>Dataset Records</h2>
                   <p className="stage-description">
-                    Browse all telemetry events generated from your frozen model. Select any event to inspect its 5-layer decisions or propose a signal correction.
+                    Browse records from the explicitly selected source. Select an event to inspect its source evidence, feature origins, five decision outputs, or propose a validated correction.
                   </p>
                 </div>
                 <label className="search-control">
@@ -1473,6 +1636,28 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                  {selectedEvent.source_provenance && (
+                    <section className="source-provenance-card">
+                      <div className="eyebrow">IMMUTABLE SOURCE EVIDENCE</div>
+                      <h3>Precinct6 signal {selectedEvent.source_record_id}</h3>
+                      <p>
+                        Original label: <strong>{String(selectedEvent.source_provenance.label_binary ?? '—')}</strong>.
+                        This is an automated Precinct correlation label, not a target for the five decision models.
+                      </p>
+                      <div className="source-feature-origins">
+                        {Object.entries(selectedEvent.feature_provenance ?? {}).map(([feature, provenance]) => (
+                          <span key={feature}>
+                            <strong>{feature}</strong> · {provenance.origin}
+                            {provenance.source_field ? ` · ${provenance.source_field}` : ''}
+                          </span>
+                        ))}
+                      </div>
+                      <details>
+                        <summary>View original Precinct6 source record (38 fields)</summary>
+                        <pre>{JSON.stringify(selectedEvent.source_record, null, 2)}</pre>
+                      </details>
+                    </section>
+                  )}
 
                   <h3>5-Layer Decision Pipeline</h3>
                   <div className="decision-state-table">
@@ -1498,7 +1683,9 @@ export default function App() {
                   </div>
                   <p className="model-note">
                     {dataset?.training_status === 'TRAINED'
-                      ? `Decision model: ${dataset.model_id} · ${dataset.model_version} · trained on dataset ${dataset.dataset_id}`
+                      ? dataset.dataset_source === 'precinct6'
+                        ? `Simulation model: ${dataset.model_id} · ${dataset.model_version}. These D1–D5 outputs use explicitly simulated context and are not decisions reported by Precinct6.`
+                        : `Simulation model: ${dataset.model_id} · ${dataset.model_version} · trained on synthetic rule-labeled scenarios.`
                       : 'Decision outputs will appear after the dataset is trained.'}
                   </p>
                 </>
@@ -1595,12 +1782,21 @@ export default function App() {
                       </div>
                     )}
 
+                    <label className="correction-evidence-control">
+                      <span>Evidence for this correction (required)</span>
+                      <textarea
+                        value={correctionEvidence}
+                        onChange={(event) => setCorrectionEvidence(event.target.value)}
+                        placeholder="Describe the evidence source or validation that justifies the corrected value."
+                        rows={3}
+                      />
+                    </label>
                     <div className="button-row correction-actions">
                       <button className="secondary" onClick={cancelCorrection} disabled={busy}>CANCEL CHANGES</button>
                       <button className="secondary" onClick={previewImpact} disabled={busy || dataset?.training_status !== 'TRAINED' || !changedValues.length || Boolean(correctionId)}>
                         {busy ? 'WORKING…' : 'PREVIEW IMPACT ↗'}
                       </button>
-                      <button onClick={applyCorrection} disabled={busy || dataset?.training_status !== 'TRAINED' || !changedValues.length || !previewMatchesProposal || Boolean(correctionId)}>
+                      <button onClick={applyCorrection} disabled={busy || dataset?.training_status !== 'TRAINED' || !changedValues.length || !previewMatchesProposal || correctionEvidence.trim().length < 10 || Boolean(correctionId)}>
                         APPLY CORRECTION
                       </button>
                       <button className={`rewind-button ${correctionId ? 'is-ready' : ''}`} onClick={executeRewind} disabled={busy || dataset?.training_status !== 'TRAINED' || !correctionId}>

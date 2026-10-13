@@ -8,6 +8,9 @@ class EvidenceStore:
     def fail_interrupted_training_jobs(self):
         return None
 
+    def fail_interrupted_precinct6_imports(self):
+        return None
+
     dataset = {
         "dataset_id": "DS-1",
         "experiment_id": "EXP-1",
@@ -130,6 +133,73 @@ def test_evidence_builder_uses_persisted_state_and_includes_recovery_context(tmp
     } in evidence["provenance_paths"]
     assert evidence["universal_log_context"]["events"][0]["details"]["message"] == "D2 prediction LOW"
     assert evidence["authority"]["persisted_database_state"] == "authoritative"
+
+
+def test_precinct6_ai_evidence_preserves_label_semantics_and_bounds_source_message(tmp_path):
+    store = EvidenceStore()
+    store.dataset = {
+        **EvidenceStore.dataset,
+        "dataset_source": "precinct6",
+        "source_revision": "revision-1",
+        "mapping_version": "mapping-1",
+        "decision_context": "simulated_context",
+        "source_manifest": {
+            "repository": "witfoo/precinct6-cybersecurity",
+            "version": "2.1.0",
+            "license": "apache-2.0",
+            "imported_record_count": 2_011_674,
+            "experiment_record_count": 200,
+            "source_label_distribution": {"benign": 1_897_153},
+            "label_semantics": "Automated correlation label, not analyst-verified truth.",
+            "decision_context_note": "Missing D1-D5 features are simulated.",
+            "source_record_ids": ["not forwarded to the LLM"],
+        },
+    }
+    source_record = {
+        "artifact_id": "ARTIFACT-1",
+        "label_binary": "malicious",
+        "message_sanitized": "source message " * 300,
+        "vendor_name": "not selected for the AI summary",
+    }
+    store.event = {
+        **EvidenceStore.event,
+        "original_state": {
+            "event_id": "EVT-1",
+            "source_record": source_record,
+            "source_provenance": {"label_binary": "malicious"},
+            "feature_provenance": {"failed_logins": {"origin": "simulated"}},
+        },
+        "current_state": {
+            "event_id": "EVT-1",
+            "source_record": source_record,
+            "source_provenance": {"label_binary": "malicious"},
+            "feature_provenance": {"failed_logins": {"origin": "simulated"}},
+        },
+    }
+    log = UniversalLog(tmp_path / "universal_log.jsonl")
+    log.record(
+        "dataset.import.completed",
+        "precinct6_importer",
+        {"source_revision": "revision-1", "accepted_rows": 2_011_674},
+    )
+
+    evidence = build_llm_evidence(
+        question="How many source records were imported?",
+        dataset_store=store,
+        universal_log=log,
+        dataset_id="DS-1",
+        event_id="EVT-1",
+    )
+
+    assert evidence["experiment"]["dataset_source"] == "precinct6"
+    assert evidence["experiment"]["source_dataset"]["source_label_distribution"] == {"benign": 1_897_153}
+    source_summary = evidence["event"]["current_state"]["source_record_summary"]
+    assert source_summary["artifact_id"] == "ARTIFACT-1"
+    assert len(source_summary["message_sanitized_excerpt"]) <= 1_200
+    assert source_summary["message_sanitized_truncated"] is True
+    assert "source_record" not in evidence["event"]["current_state"]
+    assert evidence["event"]["current_state"]["feature_provenance"]["failed_logins"]["origin"] == "simulated"
+    assert evidence["universal_log_context"]["events"][0]["details"]["accepted_rows"] == 2_011_674
 
 
 def test_chat_builds_authoritative_evidence_in_backend_not_from_client(tmp_path, monkeypatch):

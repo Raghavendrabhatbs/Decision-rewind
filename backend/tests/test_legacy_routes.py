@@ -44,6 +44,9 @@ def test_metrics_report_absent_training_and_verification_as_unavailable(tmp_path
         def fail_interrupted_training_jobs(self):
             return None
 
+        def fail_interrupted_precinct6_imports(self):
+            return None
+
         def get_active_model(self):
             return None
 

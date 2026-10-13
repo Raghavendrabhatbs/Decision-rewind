@@ -36,6 +36,12 @@ from backend.app.schemas.models import AIChatRequest
 from backend.app.services.store import store
 from backend.app.services.dataset_store import EDITABLE_FEATURES, dataset_store
 from backend.app.services.llm_evidence import build_llm_evidence
+from backend.app.services.precinct6_importer import (
+    DATASET_REVISION as PRECINCT6_REVISION,
+    MAPPING_VERSION as PRECINCT6_MAPPING_VERSION,
+    Precinct6Importer,
+    source_metadata as precinct6_source_metadata,
+)
 from backend.app.provenance.graph import FEATURE_TO_DECISIONS
 
 
@@ -44,6 +50,7 @@ async def lifespan(_app: FastAPI):
     universal_log.record("application.started", "backend", {"app": APP_NAME})
     try:
         dataset_store.fail_interrupted_training_jobs()
+        dataset_store.fail_interrupted_precinct6_imports()
         yield
     finally:
         universal_log.record("application.stopped", "backend", {"app": APP_NAME})
@@ -116,6 +123,7 @@ async def capture_universal_api_events(request, call_next):
 
 
 llm = LLMProvider()
+precinct6_importer = Precinct6Importer(dataset_store)
 
 
 @app.post("/api/universal-log/client", status_code=204)
@@ -176,6 +184,98 @@ def get_datasets() -> List[Dict[str, Any]]:
 def get_active_dataset() -> Dict[str, Any] | None:
     active = dataset_store.get_active_dataset()
     return public_dataset_metadata(active) if active is not None else None
+
+
+@app.get("/api/datasets/sources/precinct6")
+def get_precinct6_source_status() -> Dict[str, Any]:
+    return precinct6_importer.status()
+
+
+@app.post("/api/datasets/import/precinct6")
+def import_precinct6_source(background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    current = precinct6_importer.status()
+    if current["status"] == "READY" and current["cache_valid"]:
+        return current
+    started = precinct6_importer.start()
+    if started:
+        universal_log.record(
+            "dataset.import.started",
+            "precinct6_importer",
+            {
+                "source_revision": PRECINCT6_REVISION,
+                "declared_rows": current["declared_rows"],
+                "file_sha256": current["file_sha256"],
+            },
+        )
+        background_tasks.add_task(precinct6_importer.run, universal_log)
+    return precinct6_importer.status()
+
+
+@app.post("/api/datasets/precinct6")
+def create_precinct6_experiment() -> Dict[str, Any]:
+    model = dataset_store.get_active_model()
+    if model is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Train the five synthetic decision-simulation models before creating a Precinct6 experiment.",
+        )
+    import_status = precinct6_importer.status()
+    if import_status["status"] != "READY" or not import_status["cache_valid"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The pinned Precinct6 dataset is not verified and available locally. Import or restore it before creating an experiment.",
+        )
+    try:
+        seed = secrets.randbelow(2**31)
+        selected = dataset_store.sample_precinct6_records(PRECINCT6_REVISION, 200, seed)
+        events = precinct6_importer.create_experiment_events(selected, seed)
+        created = datetime.now(timezone.utc)
+        dataset_id = f"DS-{created.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3).upper()}"
+        manifest = {
+            **precinct6_source_metadata(),
+            "imported_record_count": import_status["accepted_rows"],
+            "source_label_distribution": import_status["label_distribution"],
+            "experiment_record_count": len(events),
+            "source_record_ids": [record["artifact_id"] for record in selected],
+            "decision_context": "simulated_context",
+            "decision_context_note": (
+                "Precinct6 source fields and labels are retained as evidence. Missing D1-D5 "
+                "features are separately marked simulated or unavailable; the Precinct6 label "
+                "is not used as a D1-D5 target."
+            ),
+        }
+        dataset = dataset_store.create_dataset(
+            dataset_id,
+            seed,
+            events,
+            model,
+            {
+                "dataset_source": "precinct6",
+                "source_revision": PRECINCT6_REVISION,
+                "mapping_version": PRECINCT6_MAPPING_VERSION,
+                "decision_context": "simulated_context",
+                "source_manifest": manifest,
+                "source_record_ids": [record["artifact_id"] for record in selected],
+            },
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    universal_log.record(
+        "dataset.experiment.created",
+        "dataset",
+        {
+            "dataset_id": dataset_id,
+            "dataset_source": "precinct6",
+            "source_revision": PRECINCT6_REVISION,
+            "mapping_version": PRECINCT6_MAPPING_VERSION,
+            "record_count": len(events),
+            "decision_context": "simulated_context",
+            "model_version": model["model_version"],
+        },
+    )
+    return public_dataset_metadata(dataset)
 
 
 @app.post("/api/datasets")
@@ -470,7 +570,14 @@ def preview_dataset_correction(dataset_id: str, payload: Dict[str, Any]) -> Dict
         dataset_id,
         event_id,
         "CORRECTION_PREVIEWED",
-        {"changed_features": changed_features, "affected_decisions": [item["decision_id"] for item in affected_decisions]},
+        {
+            "changed_features": changed_features,
+            "changes": [
+                {"feature": feature, "old_value": current[feature], "new_value": corrected[feature]}
+                for feature in changed_features
+            ],
+            "affected_decisions": [item["decision_id"] for item in affected_decisions],
+        },
     )
     universal_log.record(
         "counterfactual.previewed",
@@ -511,8 +618,40 @@ def apply_dataset_correction(dataset_id: str, payload: Dict[str, Any]) -> Dict[s
     event_id = payload.get("event_id")
     _require_trained_dataset(dataset_id)
     changes = _validated_changes(payload)
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, str) or len(evidence.strip()) < 10:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least 10 characters describing the evidence for this correction.",
+        )
+    preview = next(
+        (
+            row
+            for row in dataset_store.list_audit(dataset_id, limit=100)
+            if row["event_id"] == event_id and row["operation"] == "CORRECTION_PREVIEWED"
+        ),
+        None,
+    )
+    if preview is None:
+        raise HTTPException(status_code=409, detail="Preview this exact correction before saving it.")
+    expected_changes = sorted(preview["details"].get("changes", []), key=lambda item: item["feature"])
+    proposed_changes = sorted(changes, key=lambda item: item["feature"])
+    if sorted([
+        {"feature": item.get("feature"), "new_value": item.get("new_value")}
+        for item in expected_changes
+    ], key=lambda item: item["feature"]) != [
+        {"feature": item["feature"], "new_value": item["new_value"]}
+        for item in proposed_changes
+    ]:
+        raise HTTPException(status_code=409, detail="Preview the current feature values before saving this correction.")
     try:
-        result = dataset_store.create_correction(dataset_id, event_id, changes)
+        result = dataset_store.create_correction(
+            dataset_id,
+            event_id,
+            changes,
+            evidence,
+            expected_changes=expected_changes,
+        )
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
@@ -526,6 +665,7 @@ def apply_dataset_correction(dataset_id: str, payload: Dict[str, Any]) -> Dict[s
             "correction_id": result["correction_id"],
             "correlation_id": f"{dataset_id}:{event_id}",
             "changes": result["changes"],
+            "evidence": evidence.strip(),
         },
     )
     return result

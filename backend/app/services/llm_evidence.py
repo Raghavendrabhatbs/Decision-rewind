@@ -7,6 +7,50 @@ from backend.app.services.dataset_store import DatasetStore
 from backend.app.services.universal_log import UniversalLog
 
 
+def _event_state_for_ai(state: Dict[str, Any], dataset_source: str) -> Dict[str, Any]:
+    if dataset_source != "precinct6":
+        return state
+    source_record = state.get("source_record")
+    if not isinstance(source_record, dict):
+        source_record = {}
+    allowed_source_fields = (
+        "timestamp",
+        "event_time",
+        "timestamp_source",
+        "origin",
+        "org_id",
+        "artifact_id",
+        "message_type",
+        "stream_name",
+        "src_ip",
+        "dst_ip",
+        "src_host",
+        "dst_host",
+        "username",
+        "action",
+        "severity",
+        "label_binary",
+        "label_confidence",
+        "suspicion_score",
+        "disposition",
+        "disposition_category",
+    )
+    bounded_source_record = {
+        key: source_record[key]
+        for key in allowed_source_fields
+        if key in source_record
+    }
+    message = source_record.get("message_sanitized")
+    if isinstance(message, str):
+        bounded_source_record["message_sanitized_excerpt"] = message[:1_200]
+        bounded_source_record["message_sanitized_truncated"] = len(message) > 1_200
+    return {
+        key: value
+        for key, value in state.items()
+        if key != "source_record"
+    } | {"source_record_summary": bounded_source_record}
+
+
 def build_llm_evidence(
     question: str,
     dataset_store: DatasetStore,
@@ -54,6 +98,7 @@ def build_llm_evidence(
             "correction_id": correction_id,
             "decision_id": decision_id,
             "model_version": dataset.get("model_version") if dataset else None,
+            "source_revision": dataset.get("source_revision") if dataset else None,
         }.items()
         if value
     }
@@ -74,8 +119,27 @@ def build_llm_evidence(
                 "training_dataset_id",
                 "training_record_count",
                 "trained_at",
+                "dataset_source",
+                "source_revision",
+                "mapping_version",
+                "decision_context",
             )
         }
+        manifest = dataset.get("source_manifest", {})
+        if dataset.get("dataset_source") == "precinct6" and isinstance(manifest, dict):
+            evidence["experiment"]["source_dataset"] = {
+                key: manifest.get(key)
+                for key in (
+                    "repository",
+                    "version",
+                    "license",
+                    "imported_record_count",
+                    "experiment_record_count",
+                    "source_label_distribution",
+                    "label_semantics",
+                    "decision_context_note",
+                )
+            }
         audit = dataset_store.list_audit(dataset["dataset_id"], limit=100)
 
     if correction_id:
@@ -96,8 +160,14 @@ def build_llm_evidence(
             raise LookupError("Event not found in this experiment.")
         evidence["event"] = {
             "event_id": event_id,
-            "historical_state": event["original_state"],
-            "current_state": event["current_state"],
+            "historical_state": _event_state_for_ai(
+                event["original_state"],
+                dataset.get("dataset_source", "synthetic"),
+            ),
+            "current_state": _event_state_for_ai(
+                event["current_state"],
+                dataset.get("dataset_source", "synthetic"),
+            ),
         }
         historical = {}
         current = {}

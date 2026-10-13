@@ -48,6 +48,18 @@ def verify_rewind_persistence(
     for change in correction_changes:
         if recovered_state.get(change["feature"]) != change["new_value"]:
             errors.append(f"Corrected feature {change['feature']} was not persisted.")
+    for immutable_field in (
+        "source_record",
+        "source_record_id",
+        "source_label",
+        "source_provenance",
+        "feature_provenance",
+        "source_row_index",
+    ):
+        if immutable_field in original_state and (
+            recovered_state.get(immutable_field) != original_state[immutable_field]
+        ):
+            errors.append(f"Immutable source provenance field {immutable_field} was modified.")
 
     before = {item["decision_id"]: item for item in previous_decisions}
     after = {item["decision_id"]: item for item in recovered_decisions}

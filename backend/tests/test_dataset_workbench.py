@@ -217,7 +217,11 @@ def test_explicit_training_gates_experiments_and_versions_are_reused(tmp_path, m
         assert len(preview.json()["changes"]) == 3
         correction = client.post(
             f"/api/datasets/{first_experiment['dataset_id']}/corrections",
-            json={"event_id": first_event["event_id"], "changes": changes},
+            json={
+                "event_id": first_event["event_id"],
+                "changes": changes,
+                "evidence": "Validated correction for regression test.",
+            },
         )
         assert correction.status_code == 200, correction.text
         rewind = client.post(
@@ -320,7 +324,12 @@ def test_multifeature_correction_preserves_history_and_rewinds_only_changed_deci
         {"feature": "asset_criticality", "new_value": "CRITICAL"},
         {"feature": "failed_logins", "new_value": (event["failed_logins"] + 1) % 21},
     ]
-    correction = dataset_store.create_correction("DS-TEST", event["event_id"], proposed)
+    correction = dataset_store.create_correction(
+        "DS-TEST",
+        event["event_id"],
+        proposed,
+        evidence="Validated correction for regression test.",
+    )
     before_rewind = dataset_store.get_event("DS-TEST", event["event_id"])
     assert before_rewind["current_state"]["asset_criticality"] == event["asset_criticality"]
 
@@ -377,6 +386,7 @@ def test_failed_persistence_verification_rolls_back_recovery_transaction(tmp_pat
             {"feature": "failed_logins", "new_value": (event["failed_logins"] + 1) % 21},
             {"feature": "geo_anomaly", "new_value": not event["geo_anomaly"]},
         ],
+        evidence="Validated correction for regression test.",
     )
     corrected = dict(before["current_state"])
     for change in correction["changes"]:
@@ -455,6 +465,7 @@ def test_rewind_includes_downstream_decisions_when_d2_changes(tmp_path, monkeypa
             json={
                 "event_id": event["current_state"]["event_id"],
                 "changes": [{"feature": "failed_logins", "new_value": proposed_value}],
+                "evidence": "Validated correction for regression test.",
             },
         )
         assert preview_response.status_code == 200
@@ -467,6 +478,7 @@ def test_rewind_includes_downstream_decisions_when_d2_changes(tmp_path, monkeypa
             json={
                 "event_id": event["current_state"]["event_id"],
                 "changes": [{"feature": "failed_logins", "new_value": proposed_value}],
+                "evidence": "Validated correction for regression test.",
             },
         )
         assert correction_response.status_code == 200
@@ -484,6 +496,58 @@ def test_rewind_includes_downstream_decisions_when_d2_changes(tmp_path, monkeypa
     assert dataset_store.get_correction(correction_id)["status"] == "REWOUND"
 
 
+def test_correction_requires_matching_preview_and_evidence(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from backend.app import main
+    from backend.app.services.universal_log import UniversalLog
+
+    dataset_store, events, _ = _trained_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "dataset_store", dataset_store)
+    monkeypatch.setattr(main, "universal_log", UniversalLog(tmp_path / "universal_log.jsonl"))
+    event_id = events[0]["event_id"]
+    proposed_value = (events[0]["failed_logins"] + 1) % 21
+    with TestClient(main.app) as client:
+        no_preview = client.post(
+            "/api/datasets/DS-TEST/corrections",
+            json={
+                "event_id": event_id,
+                "changes": [{"feature": "failed_logins", "new_value": proposed_value}],
+                "evidence": "Validated source record.",
+            },
+        )
+        assert no_preview.status_code == 409
+        assert "Preview this exact correction" in no_preview.json()["detail"]
+
+        preview = client.post(
+            "/api/datasets/DS-TEST/preview",
+            json={
+                "event_id": event_id,
+                "changes": [{"feature": "failed_logins", "new_value": proposed_value}],
+            },
+        )
+        assert preview.status_code == 200
+
+        missing_evidence = client.post(
+            "/api/datasets/DS-TEST/corrections",
+            json={
+                "event_id": event_id,
+                "changes": [{"feature": "failed_logins", "new_value": proposed_value}],
+            },
+        )
+        assert missing_evidence.status_code == 422
+
+        stale_preview = client.post(
+            "/api/datasets/DS-TEST/corrections",
+            json={
+                "event_id": event_id,
+                "changes": [{"feature": "failed_logins", "new_value": (proposed_value + 1) % 21}],
+                "evidence": "Validated source record.",
+            },
+        )
+        assert stale_preview.status_code == 409
+
+
 def test_correction_proposal_does_not_mutate_event_state(tmp_path, monkeypatch):
     dataset_store, events, _ = _trained_store(tmp_path, monkeypatch)
     event = events[0]
@@ -491,6 +555,7 @@ def test_correction_proposal_does_not_mutate_event_state(tmp_path, monkeypatch):
         "DS-TEST",
         event["event_id"],
         [{"feature": "asset_criticality", "new_value": "CRITICAL"}],
+        evidence="Validated correction for regression test.",
     )
     state = dataset_store.get_event("DS-TEST", event["event_id"])
     assert state["current_state"]["asset_criticality"] == event["asset_criticality"]

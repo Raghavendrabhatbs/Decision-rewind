@@ -32,6 +32,7 @@ _IDENTIFIER_FILTERS = {
     "rewind_id",
     "verification_id",
     "correlation_id",
+    "source_revision",
 }
 
 

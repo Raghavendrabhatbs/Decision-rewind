@@ -17,9 +17,9 @@ DECISION-REWIND is a deterministic cybersecurity research prototype and applicat
 
 Security operations pipelines often make several dependent decisions from the same event data. If an upstream value is later corrected, recomputing every decision can create unnecessary or unsafe changes. DECISION-REWIND demonstrates a narrower workflow:
 
-1. Generate deterministic synthetic cybersecurity events.
-2. Train versioned classifiers on a 20,000-record training dataset.
-3. Create a separate 200-record experiment pinned to one trained model artifact.
+1. Select an explicit synthetic test source or import the pinned real-world Precinct6 `signals` subset.
+2. Train versioned decision-simulation classifiers on 20,000 synthetic, rule-labeled scenarios.
+3. Create a separate 200-record experiment from the selected source, pinned to one trained model artifact.
 4. Correct one or more supported event features.
 5. Replay the frozen model counterfactually.
 6. Use provenance reachability and output differences to identify affected decisions.
@@ -35,8 +35,10 @@ The LLM is deliberately outside the recovery authority boundary: it can explain 
 
 ### Dataset & Experiment Management
 - **Deterministic Generation:** Generates synthetic cybersecurity event datasets with configurable seeds.
-- **Model Training:** Trains global models on exactly 20,000 records using a stratified 80/20 split.
-- **Experiments:** Explicit creation of 200-record experiment datasets after a global model exists.
+- **Pinned Precinct6 Import:** Explicitly downloads the 117 MB `signals` Parquet at a fixed Hugging Face revision, verifies its SHA-256, schema, and actual row count, and indexes it in batches.
+- **Explicit Source Selection:** Synthetic test records are never silently mixed into a Precinct6 experiment or substituted when real records are unavailable.
+- **Model Training:** Trains the five decision-simulation models on exactly 20,000 synthetic records using a stratified 80/20 split.
+- **Experiments:** Creates exactly 200 records from the selected source after a pinned model exists; Precinct6 records are reserved once and cannot be reused.
 - **Experiment Labeling:** Labels experiments using a pinned, frozen model artifact for reproducibility.
 
 ### Decision Modeling
@@ -47,6 +49,20 @@ Five downstream decisions are modeled using Scikit-Learn:
 - **D4 (Incident Escalation):** Logistic Regression (Threat intelligence score, geo anomaly, asset criticality, D2 severity)
 - **D5 (Response Action):** Random Forest (D2 severity, asset criticality, geo anomaly, failed logins)
 - *Note:* D2 is evaluated before D4 and D5 due to dependency graphs.
+
+These five decision targets are not supplied by Precinct6. The classifiers use
+synthetic, rule-derived simulation labels; on Precinct6 records, missing decision
+features are individually marked as simulated or unavailable. Their D1–D5
+outputs are experiment results, not real-world decisions or validated
+operational predictions.
+
+### Real-World Dataset and Limits
+- Source: [WitFoo Precinct6 Cybersecurity](https://huggingface.co/datasets/witfoo/precinct6-cybersecurity), version `2.1.0`, pinned revision `96311c2e29611d8ddbf1c0d59f531f6a362b8233`, Apache-2.0.
+- The integration imports only `signals/signals.parquet` (declared 2,011,674 rows; 117,056,748 bytes). It does not download the much larger 114-million-event capture or the separate historical `incident_signals` split.
+- `artifact_id`, source metadata, all 38 source columns, and the original `label_binary` are retained with each sampled event. The importer verifies the downloaded file against SHA-256 `20d01fd225636e9b95a30bfe88c3c6faeb49e8595d4e784c96ea7fa62c6a746c`, then validates the Parquet schema and scans every row. Counts shown by the UI are from that local scan; download or validation failures are reported explicitly.
+- `benign` / `suspicious` / `malicious` labels represent WitFoo Precinct's automated incident-correlation output; the dataset card states there is no independent analyst-verified ground truth. They are preserved as source labels and are **not** translated into the five decision targets.
+- Precinct6 does not provide several current decision features, including failed-login counts, geo anomaly, and asset criticality. Those fields are generated deterministically from the experiment seed and source ID, marked `simulated`, and kept distinct from immutable source evidence. `event_time` is preferred for display time; Precinct timestamps can represent ingest/correlation time rather than device time.
+- Import is user-initiated from the data-source selector or `POST /api/datasets/import/precinct6`; startup does not download the dataset. The local Parquet cache lives under `data/precinct6/<revision>/`.
 
 ### Counterfactual Replay and Selective Recovery
 - **Multi-Feature Correction Previews:** Preview the exact impact of changing inputs.
@@ -213,10 +229,14 @@ The backend provides a comprehensive REST API. Some core endpoints include:
 - `GET /api/health`: Health check status.
 - `POST /api/models/train`: Initiates a background job to train global ML models.
 - `GET /api/models/status`: Retrieves the training status and available models.
-- `POST /api/datasets`: Generates a new experimental dataset.
+- `GET /api/datasets/sources/precinct6`: Retrieves the pinned source/import status and verified counts.
+- `POST /api/datasets/import/precinct6`: Explicitly starts the pinned Parquet download and incremental import.
+- `POST /api/datasets`: Generates a new synthetic test experiment.
+- `POST /api/datasets/precinct6`: Creates an experiment from 200 fresh, unused Precinct6 signals.
 - `POST /api/datasets/{dataset_id}/train`: Evaluates the dataset using the pinned model.
 - `POST /api/datasets/{dataset_id}/preview`: Previews a counterfactual correction.
-- `POST /api/datasets/{dataset_id}/rewind`: Executes the selective decision rewind.
+- `POST /api/datasets/{dataset_id}/corrections`: Saves a correction only after a matching preview and a non-empty evidence note.
+- `POST /api/datasets/{dataset_id}/rewind`: Executes the selectively verified decision rewind.
 - `GET /api/datasets/{dataset_id}/graph`: Fetches the provenance graph for an experiment.
 - `POST /api/ai/chat`: Queries the LLM with context for an explanation.
 
@@ -228,7 +248,8 @@ The backend provides a comprehensive REST API. Some core endpoints include:
 
 The application utilizes a local **SQLite** database (`decision_rewind.db`) created dynamically at runtime. It stores:
 - **Models:** Metadata, validation metrics, and references to `joblib` artifacts.
-- **Datasets & Events:** Synthetic events used for experiments and training.
+- **Datasets & Events:** Synthetic scenarios or experiment samples with source revision, feature mapping, label semantics, and feature-level provenance.
+- **Precinct6 Import Index:** Source IDs, row offsets, import verification counts, and experiment-use reservations. Full source records are read from the revision-pinned Parquet cache and copied into each selected experiment record.
 - **Decisions & Corrections:** Historical inputs, counterfactuals, and recovery histories.
 - **Audit Logs:** System-wide logs capturing API, ML, and frontend activity.
 

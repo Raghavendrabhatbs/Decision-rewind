@@ -20,6 +20,7 @@ EDITABLE_FEATURES = {
 }
 EVENT_COLUMNS = {
     "event_id",
+    "source_label",
     "timestamp",
     "user_id",
     "source_ip",
@@ -62,7 +63,12 @@ class DatasetStore:
                     trained_at TEXT,
                     model_path TEXT,
                     workflow_status TEXT NOT NULL DEFAULT 'WAITING_FOR_TRAINING'
-                    , d5_status TEXT NOT NULL DEFAULT 'NOT_LABELED'
+                    , d5_status TEXT NOT NULL DEFAULT 'NOT_LABELED',
+                    dataset_source TEXT NOT NULL DEFAULT 'synthetic',
+                    source_revision TEXT,
+                    mapping_version TEXT,
+                    decision_context TEXT NOT NULL DEFAULT 'synthetic_simulation',
+                    source_manifest_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE IF NOT EXISTS dataset_events (
                     dataset_id TEXT NOT NULL,
@@ -95,6 +101,7 @@ class DatasetStore:
                     changes_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     user_action TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'PENDING'
                 );
                 CREATE TABLE IF NOT EXISTS rewind_operations (
@@ -158,6 +165,36 @@ class DatasetStore:
                     artifact_sha256 TEXT NOT NULL,
                     status TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS precinct6_imports (
+                    dataset_revision TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    expected_rows INTEGER NOT NULL,
+                    parsed_rows INTEGER NOT NULL DEFAULT 0,
+                    accepted_rows INTEGER NOT NULL DEFAULT 0,
+                    skipped_rows INTEGER NOT NULL DEFAULT 0,
+                    rejected_rows INTEGER NOT NULL DEFAULT 0,
+                    file_path TEXT NOT NULL,
+                    file_sha256 TEXT,
+                    schema_json TEXT NOT NULL DEFAULT '[]',
+                    label_distribution_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS precinct6_records (
+                    dataset_revision TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    timestamp REAL NOT NULL,
+                    org_id TEXT NOT NULL,
+                    label_binary TEXT NOT NULL,
+                    usage TEXT NOT NULL DEFAULT 'AVAILABLE',
+                    experiment_dataset_id TEXT,
+                    PRIMARY KEY (dataset_revision, artifact_id),
+                    UNIQUE (dataset_revision, row_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_precinct6_available
+                    ON precinct6_records(dataset_revision, usage);
                 """
             )
             dataset_columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)")}
@@ -172,6 +209,11 @@ class DatasetStore:
                 "training_dataset_id": "TEXT",
                 "experiment_id": "TEXT",
                 "d5_status": "TEXT NOT NULL DEFAULT 'NOT_LABELED'",
+                "dataset_source": "TEXT NOT NULL DEFAULT 'synthetic'",
+                "source_revision": "TEXT",
+                "mapping_version": "TEXT",
+                "decision_context": "TEXT NOT NULL DEFAULT 'synthetic_simulation'",
+                "source_manifest_json": "TEXT NOT NULL DEFAULT '{}'",
             }.items():
                 if name not in dataset_columns:
                     conn.execute(f"ALTER TABLE datasets ADD COLUMN {name} {definition}")
@@ -186,6 +228,8 @@ class DatasetStore:
             correction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dataset_corrections)")}
             if "changes_json" not in correction_columns:
                 conn.execute("ALTER TABLE dataset_corrections ADD COLUMN changes_json TEXT NOT NULL DEFAULT '[]'")
+            if "evidence" not in correction_columns:
+                conn.execute("ALTER TABLE dataset_corrections ADD COLUMN evidence TEXT NOT NULL DEFAULT ''")
 
     def create_dataset(
         self,
@@ -193,6 +237,7 @@ class DatasetStore:
         seed: int,
         events: List[Dict[str, Any]],
         model: Dict[str, Any],
+        source_metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         if len(events) != 200:
             raise ValueError(f"Interactive experiment datasets must contain exactly 200 records; received {len(events)}.")
@@ -201,20 +246,55 @@ class DatasetStore:
             raise ValueError("Dataset event IDs must be unique.")
         now = datetime.now(timezone.utc).isoformat()
         experiment_id = f"EXP-{dataset_id.removeprefix('DS-')}"
+        source_metadata = source_metadata or {}
+        dataset_source = str(source_metadata.get("dataset_source", "synthetic"))
+        source_revision = source_metadata.get("source_revision")
+        mapping_version = source_metadata.get("mapping_version")
+        decision_context = str(source_metadata.get("decision_context", "synthetic_simulation"))
+        source_manifest = source_metadata.get("source_manifest", {})
+        source_record_ids = source_metadata.get("source_record_ids", [])
+        if dataset_source == "precinct6":
+            if not source_revision or not mapping_version or len(source_record_ids) != len(events):
+                raise ValueError("Precinct6 experiments require a pinned revision, mapping version, and one source ID per event.")
+            if len(set(source_record_ids)) != len(source_record_ids):
+                raise ValueError("Precinct6 source record IDs must be unique within an experiment.")
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if dataset_source == "precinct6":
+                imported = conn.execute(
+                    "SELECT status FROM precinct6_imports WHERE dataset_revision = ?",
+                    (source_revision,),
+                ).fetchone()
+                if imported is None or imported["status"] != "READY":
+                    raise ValueError("The pinned Precinct6 revision is not fully imported.")
+                for artifact_id in source_record_ids:
+                    cursor = conn.execute(
+                        """
+                        UPDATE precinct6_records
+                        SET usage = 'EXPERIMENT', experiment_dataset_id = ?
+                        WHERE dataset_revision = ? AND artifact_id = ? AND usage = 'AVAILABLE'
+                        """,
+                        (dataset_id, source_revision, artifact_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError(
+                            f"Precinct6 source record {artifact_id} is missing or has already been used; retry with fresh records."
+                        )
             conn.execute("UPDATE datasets SET is_active = 0")
             conn.execute(
                 """
                 INSERT INTO datasets (
                     dataset_id, seed, created_at, record_count, is_active,
                     training_status, workflow_status, model_id, model_version, training_record_count,
-                    model_path, training_dataset_id, experiment_id, d5_status
-                ) VALUES (?, ?, ?, ?, 1, 'NOT_TRAINED', 'WAITING_FOR_TRAINING', ?, ?, NULL, ?, ?, ?, 'NOT_LABELED')
+                    model_path, training_dataset_id, experiment_id, d5_status, dataset_source,
+                    source_revision, mapping_version, decision_context, source_manifest_json
+                ) VALUES (?, ?, ?, ?, 1, 'NOT_TRAINED', 'WAITING_FOR_TRAINING', ?, ?, NULL, ?, ?, ?, 'NOT_LABELED', ?, ?, ?, ?, ?)
                 """,
                 (
                     dataset_id, seed, now, len(events), model["model_id"], model["model_version"],
-                    model["artifact_path"],
-                    model["training_dataset_id"], experiment_id,
+                    model["artifact_path"], model["training_dataset_id"], experiment_id,
+                    dataset_source, source_revision, mapping_version, decision_context,
+                    json.dumps(source_manifest, sort_keys=True),
                 ),
             )
             for event in events:
@@ -242,6 +322,11 @@ class DatasetStore:
                         "model_id": model["model_id"],
                         "model_version": model["model_version"],
                         "training_dataset_id": model["training_dataset_id"],
+                        "dataset_source": dataset_source,
+                        "source_revision": source_revision,
+                        "mapping_version": mapping_version,
+                        "decision_context": decision_context,
+                        "source_record_count": len(source_record_ids),
                     }),
                     now,
                 ),
@@ -549,6 +634,7 @@ class DatasetStore:
     @staticmethod
     def _public_dataset(row: sqlite3.Row) -> Dict[str, Any]:
         dataset = dict(row)
+        dataset["source_manifest"] = json.loads(dataset.pop("source_manifest_json", "{}"))
         dataset["label_status"] = dataset.get("d5_status", "NOT_LABELED")
         dataset["training_status"] = (
             "TRAINED" if dataset["label_status"] == "LABELED" else "NOT_TRAINED"
@@ -558,6 +644,215 @@ class DatasetStore:
         dataset["generation_timestamp"] = dataset["created_at"]
         dataset["random_seed"] = dataset["seed"]
         return dataset
+
+    def get_precinct6_import(self, dataset_revision: str) -> Dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM precinct6_imports WHERE dataset_revision = ?",
+                (dataset_revision,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["schema"] = json.loads(result.pop("schema_json"))
+        result["label_distribution"] = json.loads(result.pop("label_distribution_json"))
+        return result
+
+    def start_precinct6_import(
+        self,
+        dataset_revision: str,
+        expected_rows: int,
+        file_path: str,
+    ) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status FROM precinct6_imports WHERE dataset_revision = ?",
+                (dataset_revision,),
+            ).fetchone()
+            if current and current["status"] in {"READY", "DOWNLOADING", "IMPORTING"}:
+                return False
+            conn.execute(
+                """
+                INSERT INTO precinct6_imports (
+                    dataset_revision, status, expected_rows, file_path, started_at, updated_at
+                ) VALUES (?, 'DOWNLOADING', ?, ?, ?, ?)
+                ON CONFLICT(dataset_revision) DO UPDATE SET
+                    status = 'DOWNLOADING', expected_rows = excluded.expected_rows,
+                    parsed_rows = 0, accepted_rows = 0, skipped_rows = 0, rejected_rows = 0,
+                    file_path = excluded.file_path, error = NULL, started_at = excluded.started_at,
+                    updated_at = excluded.updated_at
+                """,
+                (dataset_revision, expected_rows, file_path, now, now),
+            )
+        return True
+
+    def set_precinct6_import_status(
+        self,
+        dataset_revision: str,
+        status: str,
+        *,
+        file_sha256: str | None = None,
+        schema: List[Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE precinct6_imports
+                SET status = ?, file_sha256 = COALESCE(?, file_sha256),
+                    schema_json = COALESCE(?, schema_json), error = ?, updated_at = ?
+                WHERE dataset_revision = ?
+                """,
+                (
+                    status,
+                    file_sha256,
+                    json.dumps(schema) if schema is not None else None,
+                    error,
+                    now,
+                    dataset_revision,
+                ),
+            )
+
+    def fail_interrupted_precinct6_imports(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE precinct6_imports
+                SET status = 'FAILED',
+                    error = 'Import was interrupted by an application restart.',
+                    updated_at = ?
+                WHERE status IN ('DOWNLOADING', 'VERIFYING', 'IMPORTING')
+                """,
+                (now,),
+            )
+
+    def import_precinct6_batch(
+        self,
+        dataset_revision: str,
+        records: List[Dict[str, Any]],
+        parsed_rows: int,
+        rejected_rows: int,
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            imported = 0
+            for record in records:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO precinct6_records (
+                        dataset_revision, artifact_id, row_index, timestamp, org_id, label_binary
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dataset_revision,
+                        record["artifact_id"],
+                        record["row_index"],
+                        record["timestamp"],
+                        record["org_id"],
+                        record["label_binary"],
+                    ),
+                )
+                imported += cursor.rowcount
+            conn.execute(
+                """
+                UPDATE precinct6_imports
+                SET status = 'IMPORTING', parsed_rows = parsed_rows + ?,
+                    accepted_rows = accepted_rows + ?,
+                    skipped_rows = skipped_rows + ?, rejected_rows = rejected_rows + ?,
+                    updated_at = ?
+                WHERE dataset_revision = ?
+                """,
+                (parsed_rows, imported, len(records) - imported, rejected_rows, now, dataset_revision),
+            )
+        return imported
+
+    def finish_precinct6_import(
+        self,
+        dataset_revision: str,
+        actual_rows: int,
+        label_distribution: Dict[str, int],
+        rejected_rows: int,
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            imported_rows = conn.execute(
+                "SELECT COUNT(*) FROM precinct6_records WHERE dataset_revision = ?",
+                (dataset_revision,),
+            ).fetchone()[0]
+            import_row = conn.execute(
+                "SELECT expected_rows FROM precinct6_imports WHERE dataset_revision = ?",
+                (dataset_revision,),
+            ).fetchone()
+            if import_row is None:
+                raise LookupError("Precinct6 import job not found.")
+            if actual_rows != import_row["expected_rows"] or imported_rows != actual_rows:
+                raise ValueError(
+                    f"Precinct6 verification failed: expected {import_row['expected_rows']} unique rows, "
+                    f"scanned {actual_rows}, indexed {imported_rows}."
+                )
+            skipped_rows = actual_rows - imported_rows - rejected_rows
+            if skipped_rows < 0:
+                raise ValueError("Precinct6 import counts are inconsistent; refusing to mark the import ready.")
+            conn.execute(
+                """
+                UPDATE precinct6_imports
+                SET status = 'READY', parsed_rows = ?, accepted_rows = ?,
+                    skipped_rows = ?, rejected_rows = ?, label_distribution_json = ?,
+                    error = NULL, updated_at = ?
+                WHERE dataset_revision = ?
+                """,
+                (
+                    actual_rows,
+                    imported_rows,
+                    skipped_rows,
+                    rejected_rows,
+                    json.dumps(label_distribution, sort_keys=True),
+                    now,
+                    dataset_revision,
+                ),
+            )
+        return self.get_precinct6_import(dataset_revision) or {}
+
+    def sample_precinct6_records(
+        self,
+        dataset_revision: str,
+        limit: int,
+        seed: int,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM precinct6_imports WHERE dataset_revision = ?",
+                (dataset_revision,),
+            ).fetchone()
+            if row is None or row["status"] != "READY":
+                raise ValueError("Precinct6 must be fully imported before creating a real-data experiment.")
+            available = conn.execute(
+                "SELECT COUNT(*) FROM precinct6_records WHERE dataset_revision = ? AND usage = 'AVAILABLE'",
+                (dataset_revision,),
+            ).fetchone()[0]
+            if available < limit:
+                raise ValueError(
+                    f"Precinct6 has only {available} unused records remaining; {limit} are required. "
+                    "No synthetic records were substituted."
+                )
+            return [
+                dict(item)
+                for item in conn.execute(
+                    """
+                    SELECT artifact_id, row_index, timestamp, org_id, label_binary
+                    FROM precinct6_records
+                    WHERE dataset_revision = ? AND usage = 'AVAILABLE'
+                    ORDER BY random() LIMIT ?
+                    """,
+                    (dataset_revision, limit),
+                ).fetchall()
+            ]
 
     def list_datasets(self) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -664,9 +959,18 @@ class DatasetStore:
             "corrections": [dict(row) for row in corrections],
         }
 
-    def create_correction(self, dataset_id: str, event_id: str, changes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def create_correction(
+        self,
+        dataset_id: str,
+        event_id: str,
+        changes: List[Dict[str, Any]],
+        evidence: str,
+        expected_changes: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
         if not changes:
             raise ValueError("At least one changed feature is required.")
+        if not isinstance(evidence, str) or len(evidence.strip()) < 10:
+            raise ValueError("Provide at least 10 characters describing the evidence for this correction.")
         with self._connect() as conn:
             dataset = conn.execute("SELECT d5_status FROM datasets WHERE dataset_id = ?", (dataset_id,)).fetchone()
             row = conn.execute(
@@ -699,14 +1003,19 @@ class DatasetStore:
                     })
             if not normalized_changes:
                 raise ValueError("Proposed values must differ from the current feature values.")
+            if expected_changes is not None:
+                normalized_changes.sort(key=lambda item: item["feature"])
+                expected_changes = sorted(expected_changes, key=lambda item: item["feature"])
+                if normalized_changes != expected_changes:
+                    raise ValueError("The correction no longer matches the last validated preview.")
             correction_id = f"COR-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
             created_at = datetime.now(timezone.utc).isoformat()
             conn.execute(
                 """
                 INSERT INTO dataset_corrections (
                     correction_id, dataset_id, event_id, feature_name, old_value,
-                    new_value, changes_json, created_at, user_action, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    new_value, changes_json, created_at, user_action, evidence, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                 """,
                 (
                     correction_id,
@@ -718,14 +1027,33 @@ class DatasetStore:
                     json.dumps(normalized_changes, sort_keys=True),
                     created_at,
                     "User correction transaction",
+                    evidence.strip(),
                 ),
             )
             conn.execute(
                 "INSERT INTO dataset_audit_logs VALUES (?, ?, ?, ?, ?, ?)",
-                (f"{correction_id}-audit", dataset_id, event_id, "CORRECTION_PROPOSED", json.dumps({"correction_id": correction_id, "changes": normalized_changes}), created_at),
+                (
+                    f"{correction_id}-audit",
+                    dataset_id,
+                    event_id,
+                    "CORRECTION_PROPOSED",
+                    json.dumps(
+                        {"correction_id": correction_id, "changes": normalized_changes, "evidence": evidence.strip()},
+                        sort_keys=True,
+                    ),
+                    created_at,
+                ),
             )
             conn.execute("UPDATE datasets SET workflow_status = 'CORRECTION_APPLIED' WHERE dataset_id = ?", (dataset_id,))
-            return {"correction_id": correction_id, "dataset_id": dataset_id, "event_id": event_id, "changes": normalized_changes, "created_at": created_at, "status": "PENDING"}
+            return {
+                "correction_id": correction_id,
+                "dataset_id": dataset_id,
+                "event_id": event_id,
+                "changes": normalized_changes,
+                "evidence": evidence.strip(),
+                "created_at": created_at,
+                "status": "PENDING",
+            }
 
     def get_correction(self, correction_id: str) -> Dict[str, Any] | None:
         with self._connect() as conn:
